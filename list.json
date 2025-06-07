@@ -1,0 +1,19 @@
+{
+  "machines": [
+    {
+      "id": 1,
+      "name": "tpjoaofernandes",
+      "owner": "jppf22@github",
+      "address": "100.82.241.104",
+      "os": "Windows 11 23H2",
+      "status": "Connected"
+    },
+    {
+      "id": 2,
+      "name": "ubuntunode-virtual-machine",
+      "owner": "jppf22@github",
+      "address": "100.65.163.7",
+      "os": "Linux 5.15.0-27-generic"
+    }
+  ]
+}
