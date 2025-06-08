@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using NATS.Client.Core;
 using NATS.Client.JetStream;
 
 namespace DistributedArraySumNodeCS
@@ -35,20 +36,69 @@ namespace DistributedArraySumNodeCS
                 e.Cancel = true;
             };
 
-            await foreach (var msg in node.consumer.ConsumeAsync<String>().WithCancellation(cts.Token))
+            // Start parallel tasks for each subscription
+            Task election_subscription = Task.Run(async () =>
+                {
+                    await foreach (INatsMsg<String> msg in node.nc.SubscribeAsync<String>($"election.{node_id}", cancellationToken: cts.Token))
+                    {
+                        await node.handleElectionMessageAsync(msg);
+                    }
+                }
+            );
+
+            Task coordinator_subscription = Task.Run(async () =>
+                {
+                    await foreach (INatsMsg<String> msg in node.nc.SubscribeAsync<String>($"coordinator.{node_id}", cancellationToken: cts.Token))
+                    {
+                        await node.handleCoordinatorMessageAsync(msg);
+                    }
+                }
+            );
+
+            Task register_subscription = Task.Run(async () =>
+                {
+                    await foreach (INatsMsg<String> msg in node.nc.SubscribeAsync<String>($"register.{node_id}", cancellationToken: cts.Token))
+                    {
+                        await node.handleRegisterMessageAsync(msg);
+                    }
+                }
+            );
+
+            // TODO - IMPROVEMENT: Add a signal that fires whenever current node becomes coordinator and then subscribe to the array topic
+            Task array_subscription = Task.Run(async () =>
+                {
+                    while (!cts.Token.IsCancellationRequested)
+                    {
+                        if (node.Id == node.currentCoordinatorId) 
+                        {
+                            await foreach (INatsMsg<byte[]> msg in node.nc.SubscribeAsync<byte[]>("array", cancellationToken: cts.Token))
+                            {
+                                await node.handleArrayRequest(msg);
+                            }
+                        }
+                        else
+                        {
+                            // Wait and check again after a short delay
+                            await Task.Delay(100, cts.Token);
+                        }
+                    }
+                }
+            );
+
+            await Task.Delay(1000); // Give some time for subscriptions to be established
+
+            // Start the election process
+            await node.startElectionAsync();
+
+            // Wait for the tasks to complete (they won't, but this keeps the main thread alive)
+            try
             {
-
-                if (msg.Subject.StartsWith("election."))
-                {
-                    await node.handleElectionMessageAsync(msg);
-                }
-                else if (msg.Subject.StartsWith("coordinator."))
-                {
-                    await node.handleCoordinatorMessageAsync(msg);
-                }
-
-                await msg.AckAsync();
-                // loop never ends unless there is a terminal error, cancellation or a break
+                await Task.WhenAll(election_subscription, coordinator_subscription, array_subscription);
+            }
+            catch (OperationCanceledException)
+            {
+                // Handle cancellation gracefully
+                Console.WriteLine("Node shutdown complete.");
             }
         }
     }
