@@ -41,11 +41,11 @@ namespace DistributedArraySumNodeCS
         public string Address { get; set; }
 
         private SortedDictionary<int, String> peers;
-        private List<int> active_workers = [];
         private readonly String natsServerURl;
         public NatsClient nc;
         public int? currentCoordinatorId = null;
         private int[] dataArray = Array.Empty<int>();
+        private List<int> active_workers = [];
         public Node(int id, String address, String peers_file_path, String natsServerURl)
         {
             Id = id;
@@ -116,7 +116,7 @@ namespace DistributedArraySumNodeCS
             {
                 await foreach (NatsMsg<String> msg in nc.SubscribeAsync<String>($"election.ack.{Id}").WithCancellation(cts.Token))
                 {
-                    Console.WriteLine($"Node {Id} received Election Ack from {msg.Subject}\n");
+                    Console.WriteLine($"Node {Id} received Election Ack from {msg.Data}\n");
                     ackReceived = true;
                 }
             }
@@ -130,6 +130,8 @@ namespace DistributedArraySumNodeCS
             {
                 Console.WriteLine($"Node {Id} did not receive any acks, becoming coordinator.");
                 currentCoordinatorId = Id;
+                dataArray = Array.Empty<int>(); // Reset data array
+                active_workers.Clear(); // Clear active workers
                 await announceCoordinator();
             }
             else
@@ -237,16 +239,153 @@ namespace DistributedArraySumNodeCS
                 return; // Exit if deserialization fails
             }
 
+            if (active_workers.Count == 0)
+            {
+                Console.WriteLine($"Node {Id} has no active workers to distribute data. Calculating at coordinator...");
+                int sum = dataArray.Sum();
+                Console.WriteLine($"Node {Id} calculated sum at coordinator: {sum}");
+                await msg.ReplyAsync(Encoding.UTF8.GetBytes($"{sum}"));
+                return;
+            }
+            
+            var workerChunks = SplitArrayPerWorkers(dataArray, active_workers);
 
-            // TESTING --- SUPPOSED TO DISH OUT TO REGISTERED WORKERS
+            // Main loop: send to all, await in parallel, redistribute if needed
+            var remainingChunks = new Dictionary<int, int[]>(workerChunks);
+            var availableWorkers = new List<int>(active_workers);
+            int totalSum = 0;
 
-            // Calculate the sum of the array
-            int sum = dataArray.Sum();
-            Console.WriteLine($"Node {Id} calculated sum: {sum}");
-            // Publish the result to all active workers
-            var resultMessage = Encoding.UTF8.GetBytes($"{sum}");
+            while (remainingChunks.Count > 0 && availableWorkers.Count > 0)
+            {
+                var tasks = remainingChunks
+                    .Where(kvp => availableWorkers.Contains(kvp.Key))
+                    .Select(kvp =>
+                    {
+                        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                        return SendChunkAndAwaitReplyAsync(kvp.Key, kvp.Value, cts.Token);
+                    })
+                    .ToList();
 
-            await msg.ReplyAsync(resultMessage);
+                var results = await Task.WhenAll(tasks);
+
+                // Collect successful results and failed workers
+                var failedChunks = new List<int[]>();
+                var succeededWorkers = new List<int>();
+                foreach (var (workerId, sum) in results)
+                {
+                    if (sum.HasValue)
+                    {
+                        totalSum += sum.Value;
+                        succeededWorkers.Add(workerId);
+                    }
+                    else
+                    {
+                        // Failed, add chunk for redistribution
+                        failedChunks.Add(remainingChunks[workerId]);
+                        availableWorkers.Remove(workerId);
+                        active_workers.Remove(workerId);
+                    }
+                }
+
+                // Remove succeeded workers' chunks
+                foreach (var wid in succeededWorkers)
+                    remainingChunks.Remove(wid);
+
+                // Redistribute failed chunks among remaining workers
+                if (failedChunks.Count > 0 && availableWorkers.Count > 0)
+                {
+                    // Flatten all failed chunks
+                    var allFailedNumbers = failedChunks.SelectMany(x => x).ToArray();
+                    int n = availableWorkers.Count;
+                    int baseChunk = allFailedNumbers.Length / n;
+                    int rem = allFailedNumbers.Length % n;
+                    int idx = 0;
+                    foreach (var wid in availableWorkers)
+                    {
+                        int sz = baseChunk + (rem-- > 0 ? 1 : 0);
+                        if (sz == 0) break;
+                        remainingChunks[wid] = allFailedNumbers.Skip(idx).Take(sz).ToArray();
+                        idx += sz;
+                    }
+                }
+                else
+                {
+                    // No available workers left, sum remaining chunks locally
+                    foreach (var chunk in remainingChunks.Values)
+                        totalSum += chunk.Sum();
+                    break;
+                }
+            }
+
+            await msg.ReplyAsync(Encoding.UTF8.GetBytes($"{totalSum}"));
+        }
+
+        private static Dictionary<int, int[]> SplitArrayPerWorkers(int[] dataArray, List<int> workerIds)
+        {
+            int totalWorkers = workerIds.Count;
+            int chunkSize = dataArray.Length / totalWorkers;
+            int remainder = dataArray.Length % totalWorkers;
+            int start = 0;
+            var workerChunks = new Dictionary<int, int[]>();
+            for (int i = 0; i < totalWorkers; i++)
+            {
+                int currentChunkSize = chunkSize + (i < remainder ? 1 : 0);
+                int[] chunk = dataArray.Skip(start).Take(currentChunkSize).ToArray();
+                start += currentChunkSize;
+                workerChunks[workerIds[i]] = chunk;
+            }
+            return workerChunks;
+        }
+
+        public async Task<(int workerId, int? sum)> SendChunkAndAwaitReplyAsync(int workerId, int[] chunk, CancellationToken token)
+        {
+            var chunkPayload = new ArrayRequest { numbers = chunk };
+            byte[] chunkBytes = JsonSerializer.SerializeToUtf8Bytes(chunkPayload);
+            string subject = $"data.{workerId}";
+            string replySubject = $"data.reply.{workerId}";
+
+            // Subscribe for this worker's reply
+            var sub = nc.SubscribeAsync<byte[]>(replySubject, cancellationToken: token);
+
+            await nc.PublishAsync<byte[]>(subject, chunkBytes, cancellationToken: token, replyTo: replySubject);
+            Console.WriteLine($"Node {Id} sent chunk [{string.Join(", ", chunk)}] to worker {workerId}");
+
+            try
+            {
+                await foreach (var workerMsg in sub.WithCancellation(token))
+                {
+                    int workerSum = int.Parse(Encoding.UTF8.GetString(workerMsg.Data));
+                    Console.WriteLine($"Node {Id} received sum {workerSum} from worker {workerId}");
+                    return (workerId, workerSum);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            Console.WriteLine($"Node {Id} timed out waiting for worker {workerId} reply.");
+            return (workerId, null);
+        }
+
+        public async Task handleDataMessageAsync(INatsMsg<byte[]> msg)
+        {
+            try
+            {
+                var payload = System.Text.Json.JsonSerializer.Deserialize<ArrayRequest>(msg.Data);
+                if (payload == null || payload.numbers == null)
+                {
+                    Console.WriteLine($"Node {Id} received invalid data message.");
+                    return;
+                }
+                int sum = payload.numbers.Sum();
+                Console.WriteLine($"Node {Id} calculated partial sum: {sum}");
+
+                // Reply to reply subject
+                await nc.PublishAsync<byte[]>($"data.reply.{Id}", data: Encoding.UTF8.GetBytes($"{sum}"));
+            }
+            catch (JsonException ex)
+            {
+                Console.WriteLine($"Node {Id} failed to deserialize data message: {ex.Message}");
+            }
         }
     }
 }
