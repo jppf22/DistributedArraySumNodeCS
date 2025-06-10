@@ -19,14 +19,16 @@ namespace DistributedArraySumNodeCS
          */
         static async Task Main(string[] args)
         {
+
+            const int heartbeat_interval = 500; // Heartbeat interval in milliseconds
+            const int heartbeat_check_interval = 100; // Interval to check for heartbeat in milliseconds
+            const int heartbeat_timeout = 5; // Heartbeat timeout in seconds
+
             /*TODO: ADD Command Line arguments error handling*/
             int node_id = int.Parse(args[0]);
             string node_address = args[1];
             string peers_file_path = args[2];
             string natsServerURl = "100.82.241.104"; //Change this to your NATS server URL
-
-            Node node = new Node(node_id, node_address, peers_file_path, natsServerURl);
-            await node.startNodeAsync();
 
             var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (s, e) =>
@@ -35,6 +37,10 @@ namespace DistributedArraySumNodeCS
                 cts.Cancel();
                 e.Cancel = true;
             };
+
+            Node node = new Node(node_id, node_address, peers_file_path, natsServerURl, cts);
+            await node.startNodeAsync();
+
 
             // Start parallel tasks for each subscription
             Task election_subscription = Task.Run(async () =>
@@ -124,81 +130,66 @@ namespace DistributedArraySumNodeCS
 
             Task heartbeat_task = Task.Run(async () =>
             {
-                CancellationTokenSource subscriptionCts;
-
                 while (!cts.Token.IsCancellationRequested)
                 {
-                    if (node.Id == node.currentCoordinatorId) //Coordinator
+                    if (node.Id == node.currentCoordinatorId) // Coordinator
                     {
-                        // Create new cancellation source for this subscription session
-                        subscriptionCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-
-                        _ = Task.Run(async () =>  // Monitoring task
-                        {
-                            while (!subscriptionCts.Token.IsCancellationRequested)
-                            {
-                                await Task.Delay(100);
-                                if (node.Id != node.currentCoordinatorId)
-                                {
-                                    subscriptionCts.Cancel();
-                                    break;
-                                }
-                            }
-                        }, subscriptionCts.Token);
-
-                        while (!subscriptionCts.Token.IsCancellationRequested)
+                        Console.WriteLine($"Node {node.Id} is the coordinator. Sending heartbeats...");
+                        while (node.Id == node.currentCoordinatorId && !cts.Token.IsCancellationRequested)
                         {
                             try
                             {
-                                Console.WriteLine("Sending heartbeat...");
-                                await node.nc.PublishAsync($"heartbeat.{node_id}", Encoding.UTF8.GetBytes($"{node_id}"), cancellationToken: subscriptionCts.Token);
-                                await Task.Delay(500, subscriptionCts.Token); // Wait before sending next heartbeat
+                                await node.nc.PublishAsync($"heartbeat.{node.Id}", Encoding.UTF8.GetBytes($"{node.Id}"), cancellationToken: cts.Token);
+                                await Task.Delay(heartbeat_interval, cts.Token);
                             }
                             catch (OperationCanceledException)
                             {
-                                // Expected when coordinator changes
                                 break;
                             }
                         }
-
-                        subscriptionCts.Dispose();
                     }
-                    else if(node.currentCoordinatorId.HasValue)// Worker
+                    else if (node.currentCoordinatorId.HasValue) // Worker
                     {
-                        subscriptionCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+                        int? lastCoordinator = node.currentCoordinatorId;
                         string heartbeatSubject = $"heartbeat.{node.currentCoordinatorId}";
                         DateTime lastHeartbeat = DateTime.UtcNow;
 
-                        var heartbeatListener = Task.Run(async() =>
+                        using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+                        var heartbeatTask = Task.Run(async () =>
                         {
-                            await foreach (var msg in node.nc.SubscribeAsync<byte[]>(heartbeatSubject, cancellationToken: subscriptionCts.Token))
+                            await foreach (var msg in node.nc.SubscribeAsync<byte[]>(heartbeatSubject, cancellationToken: heartbeatCts.Token))
                             {
                                 lastHeartbeat = DateTime.UtcNow;
-                                Console.WriteLine($"Received heartbeat from coordinator {node.currentCoordinatorId} at {lastHeartbeat}");
+                                // Optionally log: Console.WriteLine($"Received heartbeat from coordinator {node.currentCoordinatorId} at {lastHeartbeat}");
                             }
-                        }, subscriptionCts.Token);
+                        }, heartbeatCts.Token);
 
-                        while (!subscriptionCts.Token.IsCancellationRequested)
+                        // Monitor for missed heartbeats
+                        while (node.currentCoordinatorId == lastCoordinator && !cts.Token.IsCancellationRequested)
                         {
-                            if ((DateTime.UtcNow - lastHeartbeat).TotalSeconds > 1) // If no heartbeat received in 1 second (2 heartbeats missed)
+                            if ((DateTime.UtcNow - lastHeartbeat).TotalSeconds > heartbeat_timeout)
                             {
-                                Console.WriteLine($"No heartbeat from coordinator {node.currentCoordinatorId} for more than 1 second. Starting election.");
-                                await node.startElectionAsync();
-                                break; // Exit the loop to allow for a new election
+                                Console.WriteLine($"No heartbeat from coordinator {lastCoordinator} for more than {heartbeat_timeout} seconds. Starting election.");
+                                heartbeatCts.Cancel();
+
+                                if (!node.IsElectionOngoing)
+                                    await node.startElectionAsync();
+                                break;
                             }
-                            await Task.Delay(1000, subscriptionCts.Token); // Wait before checking again
+                            await Task.Delay(heartbeat_check_interval, cts.Token);
                         }
 
-                        subscriptionCts.Cancel();
-                        subscriptionCts.Dispose();
+                        heartbeatCts.Cancel();
+                        try { await heartbeatTask; } catch { /* ignore */ }
                     }
                     else
                     {
-                        // If no coordinator is set, wait before checking again
-                        await Task.Delay(100, cts.Token);
+                        // No coordinator known, wait and retry
+                        await Task.Delay(200, cts.Token);
                     }
                 }
             });
+
 
             await Task.Delay(1000); // Give some time for subscriptions to be established
 

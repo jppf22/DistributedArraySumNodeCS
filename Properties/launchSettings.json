@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "DistributedArraySumNodeCS": {
+      "commandName": "Project",
+      "commandLineArgs": "4\r\n100.82.241.104\r\n\"D:\\WUT\\EDSIS\\Peers_List_File\\list.json\""
+    }
+  }
+}

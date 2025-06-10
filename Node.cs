@@ -40,17 +40,32 @@ namespace DistributedArraySumNodeCS
         public int Id { get; set; }
         public string Address { get; set; }
 
+        public CancellationToken GlobalCancellationToken { get; set; }
+
         private SortedDictionary<int, String> peers;
         private readonly String natsServerURl;
         public NatsClient nc;
+
+
         public int? currentCoordinatorId = null;
+        private bool isElectionOngoing = false;
+        private readonly object electionLock = new object();
+
+        public bool IsElectionOngoing
+        {
+            get { lock (electionLock) { return isElectionOngoing; } }
+        }
+
         private int[] dataArray = Array.Empty<int>();
         private List<int> active_workers = [];
-        public Node(int id, String address, String peers_file_path, String natsServerURl)
+
+
+        public Node(int id, String address, String peers_file_path, String natsServerURl, CancellationTokenSource global_cts)
         {
             Id = id;
             Address = address;
             peers = new SortedDictionary<int, String>();
+            GlobalCancellationToken = global_cts.Token;
             if (File.Exists(peers_file_path))
             {
                 try
@@ -92,60 +107,84 @@ namespace DistributedArraySumNodeCS
 
         public async Task startElectionAsync()
         {
-            Console.WriteLine($"Node {Id} starting election...");
-
-            var electionMessage = $"{Id}";
-            var higherPeerIds = peers.Keys.Where(pid => pid > Id).ToList();
-
-            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            var ackReceived = false;
-
-            var publishTasks = higherPeerIds.Select(async peerId =>
+            lock (electionLock)
             {
-                await nc.PublishAsync(
-                    subject: $"election.{peerId}",
-                    data: Encoding.UTF8.GetBytes(electionMessage),
-                    cancellationToken: cts.Token
-                );
-            }).ToList();
+                if (isElectionOngoing) return;
+                isElectionOngoing = true;
+            }
 
-            await Task.WhenAll(publishTasks);
-
-            // After publishing, must wait for reply from nodes
             try
             {
-                await foreach (NatsMsg<String> msg in nc.SubscribeAsync<String>($"election.ack.{Id}").WithCancellation(cts.Token))
-                {
-                    Console.WriteLine($"Node {Id} received Election Ack from {msg.Data}\n");
-                    ackReceived = true;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Timeout occurred, no ack received
-            }
 
 
-            if (!ackReceived)
-            {
-                Console.WriteLine($"Node {Id} did not receive any acks, becoming coordinator.");
-                currentCoordinatorId = Id;
+                Console.WriteLine($"Node {Id} starting election...");
                 dataArray = Array.Empty<int>(); // Reset data array
                 active_workers.Clear(); // Clear active workers
-                await announceCoordinator();
+                currentCoordinatorId = null; // Reset current coordinator ID
+
+                var electionMessage = $"{Id}";
+                var higherPeerIds = peers.Keys.Where(pid => pid > Id).ToList();
+
+                // Combine the global cancellation token with the timeout
+                var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(2)).Token);
+
+                var ackReceived = false;
+
+                var publishTasks = higherPeerIds.Select(async peerId =>
+                {
+                    Console.WriteLine($"Node {Id} publishing election message to Node {peerId}");
+                    await nc.PublishAsync(
+                        subject: $"election.{peerId}",
+                        data: Encoding.UTF8.GetBytes(electionMessage),
+                        cancellationToken: cts.Token
+                    );
+                }).ToList();
+
+                await Task.WhenAll(publishTasks);
+
+                // After publishing, must wait for reply from nodes
+                try
+                {
+                    await foreach (NatsMsg<String> msg in nc.SubscribeAsync<String>($"election.ack.{Id}").WithCancellation(cts.Token))
+                    {
+                        Console.WriteLine($"Node {Id} received Election Ack from {msg.Data}\n");
+                        ackReceived = true;
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Timeout occurred, no ack received
+                }
+
+
+                if (!ackReceived)
+                {
+                    Console.WriteLine($"Node {Id} did not receive any acks, becoming coordinator.");
+                    currentCoordinatorId = Id;
+                    await announceCoordinator();
+                }
+                else
+                {
+                    // Not coordinator, clear active_workers list
+                    active_workers.Clear();
+                    Console.WriteLine($"Node {Id} received at least one ack, will not become coordinator.");
+                }
             }
-            else
+            finally
             {
-                // Not coordinator, clear active_workers list
-                active_workers.Clear();
-                Console.WriteLine($"Node {Id} received at least one ack, will not become coordinator.");
+                lock (electionLock)
+                {
+                    isElectionOngoing = false; // Reset election flag
+                }
             }
         }
 
         public async Task announceCoordinator()
         {
             var coordinatorMessage = $"{Id}";
-            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+
+            // Combine the global cancellation token with the timeout
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(2)).Token);
 
             var publishTasks = peers.Keys.Select(async peerId =>
                 {
@@ -163,7 +202,9 @@ namespace DistributedArraySumNodeCS
         public async Task registerAtCoordinator()
         {
             var registerMessage = $"{Id}";
-            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+
+            // Combine the global cancellation token with the timeout
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(2)).Token);
 
             await nc.PublishAsync(
                     subject: $"register.{currentCoordinatorId}",
@@ -198,15 +239,28 @@ namespace DistributedArraySumNodeCS
             // Acknowledge the election message
             await nc.PublishAsync($"election.ack.{peerId}", Encoding.UTF8.GetBytes($"{Id}"));
 
+            currentCoordinatorId = null; // Reset current coordinator ID
+
+
             if (peerId < Id)
             {
+                // Avoid election storm
+                await Task.Delay(new Random().Next(100, 300));
+
                 // If peers ID is lower, this node starts its own election
                 await startElectionAsync();
             }
+
         }
 
         public async Task handleCoordinatorMessageAsync(INatsMsg<String> msg)
         {
+            lock (electionLock)
+            {
+                isElectionOngoing = false; // Cancel any pending elections
+            }
+
+
             int peerId = int.Parse(msg.Data);
             Console.WriteLine($"Node {Id} received coordinator message from Node {peerId}");
             currentCoordinatorId = peerId;
@@ -291,6 +345,10 @@ namespace DistributedArraySumNodeCS
                 foreach (var wid in succeededWorkers)
                     remainingChunks.Remove(wid);
 
+                // Remove failed workers’ chunks before redistributing
+                foreach (var failedWorker in remainingChunks.Keys.Except(availableWorkers).ToList())
+                    remainingChunks.Remove(failedWorker);
+
                 // Redistribute failed chunks among remaining workers
                 if (failedChunks.Count > 0 && availableWorkers.Count > 0)
                 {
@@ -310,11 +368,25 @@ namespace DistributedArraySumNodeCS
                 }
                 else
                 {
+
                     // No available workers left, sum remaining chunks locally
                     foreach (var chunk in remainingChunks.Values)
                         totalSum += chunk.Sum();
+                    
+                    foreach(var chunk in failedChunks)
+                        totalSum += chunk.Sum();
+
                     break;
                 }
+            }
+
+            if(availableWorkers.Count == 0)
+            {
+                Console.WriteLine($"Node {Id} calculated sum at coordinator: {totalSum}");
+            }
+            else
+            {
+                Console.WriteLine($"Node {Id} calculated total sum: {totalSum} after distributing to workers: {string.Join(", ", availableWorkers)}");
             }
 
             await msg.ReplyAsync(Encoding.UTF8.GetBytes($"{totalSum}"));
