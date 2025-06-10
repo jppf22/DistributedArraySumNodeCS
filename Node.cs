@@ -147,7 +147,7 @@ namespace DistributedArraySumNodeCS
                 {
                     await foreach (NatsMsg<String> msg in nc.SubscribeAsync<String>($"election.ack.{Id}").WithCancellation(cts.Token))
                     {
-                        Console.WriteLine($"Node {Id} received Election Ack from {msg.Data}\n");
+                        Console.WriteLine($"Node {Id} received Election Ack from {msg.Data}.");
                         ackReceived = true;
                     }
                 }
