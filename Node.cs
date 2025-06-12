@@ -12,13 +12,13 @@ using System.Text.Json;
 
 namespace DistributedArraySumNodeCS
 {
-    internal class PeersFile
+    public class PeersFile
     {
         public required List<PeersJSONClass> machines { get; set; }
     }
 
 
-    internal class PeersJSONClass
+    public class PeersJSONClass
     {
         public required int id { get; set; }
         public required String name { get; set; }
@@ -27,14 +27,14 @@ namespace DistributedArraySumNodeCS
         public required String os { get; set; }
         public String? status { get; set; }
     }
-    internal class ArrayRequest
+    public class ArrayRequest
     {
         public required int[] numbers { get; set; }
     }
 
 
 
-    internal class Node
+    public class Node
     {
 
         public int Id { get; set; }
@@ -56,9 +56,10 @@ namespace DistributedArraySumNodeCS
             get { lock (electionLock) { return isElectionOngoing; } }
         }
 
-        private int[] dataArray = Array.Empty<int>();
-        private List<int> active_workers = [];
+        public int[] dataArray = Array.Empty<int>();
+        public List<int> active_workers = [];
 
+        public readonly int timeout_general = 3; 
 
         public Node(int id, String address, String peers_file_path, String natsServerURl, CancellationTokenSource global_cts)
         {
@@ -126,7 +127,7 @@ namespace DistributedArraySumNodeCS
                 var higherPeerIds = peers.Keys.Where(pid => pid > Id).ToList();
 
                 // Combine the global cancellation token with the timeout
-                var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(2)).Token);
+                var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(timeout_general)).Token);
 
                 var ackReceived = false;
 
@@ -184,7 +185,7 @@ namespace DistributedArraySumNodeCS
             var coordinatorMessage = $"{Id}";
 
             // Combine the global cancellation token with the timeout
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(2)).Token);
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(timeout_general)).Token);
 
             var publishTasks = peers.Keys.Select(async peerId =>
                 {
@@ -204,7 +205,7 @@ namespace DistributedArraySumNodeCS
             var registerMessage = $"{Id}";
 
             // Combine the global cancellation token with the timeout
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(2)).Token);
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(GlobalCancellationToken, new CancellationTokenSource(TimeSpan.FromSeconds(timeout_general)).Token);
 
             await nc.PublishAsync(
                     subject: $"register.{currentCoordinatorId}",
@@ -214,14 +215,20 @@ namespace DistributedArraySumNodeCS
 
             Console.WriteLine($"Node {Id} registered at coordinator {currentCoordinatorId}.");
 
-
+            bool ackReceived = false;
             // Wait for acknowledgment from the coordinator
             try
             {
                 await foreach (NatsMsg<String> msg in nc.SubscribeAsync<String>($"register.ack.{Id}").WithCancellation(cts.Token))
                 {
                     Console.WriteLine($"Node {Id} received registration ack from coordinator {currentCoordinatorId}.");
+                    ackReceived = true;
                     break; // Exit loop on successful ack
+                }
+                if (!ackReceived)
+                {
+                    Console.WriteLine($"Node {Id} did not receive registration ack from coordinator {currentCoordinatorId} (subscription ended without ack).");
+                    await startElectionAsync();
                 }
             }
             catch (OperationCanceledException)
@@ -233,6 +240,7 @@ namespace DistributedArraySumNodeCS
 
         public async Task handleElectionMessageAsync(INatsMsg<String> msg)
         {
+
             int peerId = int.Parse(msg.Data);
             Console.WriteLine($"Node {Id} received election message from Node {peerId}");
 
@@ -240,7 +248,6 @@ namespace DistributedArraySumNodeCS
             await nc.PublishAsync($"election.ack.{peerId}", Encoding.UTF8.GetBytes($"{Id}"));
 
             currentCoordinatorId = null; // Reset current coordinator ID
-
 
             if (peerId < Id)
             {
@@ -315,7 +322,7 @@ namespace DistributedArraySumNodeCS
                     .Where(kvp => availableWorkers.Contains(kvp.Key))
                     .Select(kvp =>
                     {
-                        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeout_general));
                         return SendChunkAndAwaitReplyAsync(kvp.Key, kvp.Value, cts.Token);
                     })
                     .ToList();
@@ -392,7 +399,7 @@ namespace DistributedArraySumNodeCS
             await msg.ReplyAsync(Encoding.UTF8.GetBytes($"{totalSum}"));
         }
 
-        private static Dictionary<int, int[]> SplitArrayPerWorkers(int[] dataArray, List<int> workerIds)
+        public static Dictionary<int, int[]> SplitArrayPerWorkers(int[] dataArray, List<int> workerIds)
         {
             int totalWorkers = workerIds.Count;
             int chunkSize = dataArray.Length / totalWorkers;

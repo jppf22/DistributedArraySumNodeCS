@@ -9,7 +9,7 @@ using NATS.Client.JetStream;
 
 namespace DistributedArraySumNodeCS
 {
-    internal class DistributedSum
+    public class DistributedSum
     {
         /*
         args:
@@ -20,15 +20,15 @@ namespace DistributedArraySumNodeCS
         static async Task Main(string[] args)
         {
 
-            const int heartbeat_interval = 500; // Heartbeat interval in milliseconds
+            const int heartbeat_interval = 100; // Heartbeat interval in milliseconds
             const int heartbeat_check_interval = 100; // Interval to check for heartbeat in milliseconds
-            const int heartbeat_timeout = 5; // Heartbeat timeout in seconds
+            const int heartbeat_timeout = 10; // Heartbeat timeout in seconds
 
             /*TODO: ADD Command Line arguments error handling*/
             int node_id = int.Parse(args[0]);
             string node_address = args[1];
             string peers_file_path = args[2];
-            string natsServerURl = "100.82.241.104"; //Change this to your NATS server URL
+            string natsServerURl = args[3]; //Change this to your NATS server URL
 
             var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (s, e) =>
@@ -40,7 +40,6 @@ namespace DistributedArraySumNodeCS
 
             Node node = new Node(node_id, node_address, peers_file_path, natsServerURl, cts);
             await node.startNodeAsync();
-
 
             // Start parallel tasks for each subscription
             Task election_subscription = Task.Run(async () =>
@@ -130,6 +129,7 @@ namespace DistributedArraySumNodeCS
 
             Task heartbeat_task = Task.Run(async () =>
             {
+
                 while (!cts.Token.IsCancellationRequested)
                 {
                     if (node.Id == node.currentCoordinatorId) // Coordinator
@@ -173,7 +173,11 @@ namespace DistributedArraySumNodeCS
                                 heartbeatCts.Cancel();
 
                                 if (!node.IsElectionOngoing)
+                                {
+                                    // Avoid election storm
+                                    await Task.Delay(new Random().Next(100, 300));
                                     await node.startElectionAsync();
+                                }
                                 break;
                             }
                             await Task.Delay(heartbeat_check_interval, cts.Token);
@@ -185,11 +189,10 @@ namespace DistributedArraySumNodeCS
                     else
                     {
                         // No coordinator known, wait and retry
-                        await Task.Delay(200, cts.Token);
+                        await Task.Delay(100, cts.Token);
                     }
                 }
             });
-
 
             await Task.Delay(1000); // Give some time for subscriptions to be established
 
